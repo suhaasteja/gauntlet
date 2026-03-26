@@ -1,0 +1,20 @@
+# State files (generated during runs)
+state/prd-sections/
+state/scenarios/
+state/reviews/
+state/agents/
+state/rounds/
+state/logs/
+state/config.json
+
+# Output reports
+output/
+
+# OS files
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Temp files
+*.tmp
