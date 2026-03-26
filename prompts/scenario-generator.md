@@ -7,7 +7,7 @@ You are the scenario generator responsible for creating adversarial stress-test 
 1. **Read high-risk PRD sections** (those flagged by triage with score ≥ threshold)
 2. **Generate failure scenarios** that stress-test the PRD's claims
 3. **Create probing questions** that personas will investigate
-4. **Write scenario files** to `state/scenarios/`
+4. **Output scenario JSON** for the script to save
 
 ## Scenario Categories
 
@@ -53,9 +53,9 @@ For each section, generate scenarios across these categories:
 - Null/missing required fields
 - Corrupt or legacy data
 
-## Scenario File Format
+## Output Format
 
-Create one JSON file per section:
+Output JSON wrapped in a code fence with `json` language tag:
 
 ```json
 {
@@ -130,9 +130,10 @@ SCEN-005 (third_party_failure):
 "What if the push notification provider (e.g., Firebase) is rate-limiting? Does the system queue notifications? Drop them? Show an error?"
 ```
 
-## Output Signal
+## Output Instructions
 
-After creating scenario files, output:
+1. **Output the JSON** wrapped in a ```json code fence (as shown above)
+2. **After the JSON**, output the completion signal:
 
 ```
 <gauntlet>SCENARIOS_GENERATED</gauntlet>

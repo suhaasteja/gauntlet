@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gauntlet - PRD Red-Teaming Workflow</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #fafafa;
+      color: #222;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    
+    .header {
+      background: white;
+      border-bottom: 1px solid #ddd;
+      padding: 20px 32px;
+      text-align: center;
+      flex-shrink: 0;
+    }
+    
+    .header h1 {
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+    }
+    
+    .header p {
+      font-size: 14px;
+      color: #666;
+    }
+    
+    .flow-container {
+      flex: 1;
+      position: relative;
+      background: #fafafa;
+      background-image: radial-gradient(circle, #ddd 1px, transparent 1px);
+      background-size: 20px 20px;
+      padding: 40px 20px;
+      overflow: auto;
+      min-height: 0;
+    }
+    
+    .flowchart {
+      position: relative;
+      width: 800px;
+      margin: 0 auto;
+      height: 950px;
+    }
+    
+    .node {
+      position: absolute;
+      width: 240px;
+      min-height: 80px;
+      background: white;
+      border: 2px solid #ccc;
+      border-radius: 8px;
+      padding: 16px;
+      transition: all 0.5s ease;
+      opacity: 0;
+      transform: scale(0.8);
+      pointer-events: none;
+    }
+    
+    .node.visible {
+      opacity: 1;
+      transform: scale(1);
+      pointer-events: auto;
+    }
+    
+    .node.active {
+      border-color: #6366f1;
+      box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
+    }
+    
+    .node-title {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 6px;
+      color: #222;
+    }
+    
+    .node-description {
+      font-size: 12px;
+      color: #666;
+      line-height: 1.4;
+    }
+    
+    .edge {
+      position: absolute;
+      pointer-events: none;
+      transition: opacity 0.5s ease;
+      opacity: 0;
+    }
+    
+    .edge.visible {
+      opacity: 1;
+    }
+    
+    .edge line {
+      stroke: #222;
+      stroke-width: 2;
+    }
+    
+    .edge polygon {
+      fill: #222;
+    }
+    
+    .edge-label {
+      font-size: 12px;
+      font-weight: 600;
+      fill: #222;
+      background: white;
+    }
+    
+    .note {
+      position: absolute;
+      width: 220px;
+      background: #fff8e6;
+      border: 2px solid #c9a227;
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #222;
+      transition: opacity 0.5s ease;
+      opacity: 0;
+      white-space: pre-line;
+    }
+    
+    .note.visible {
+      opacity: 1;
+    }
+    
+    .controls {
+      background: white;
+      border-top: 1px solid #ddd;
+      padding: 20px 32px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 20px;
+      flex-shrink: 0;
+    }
+    
+    .btn {
+      padding: 10px 20px;
+      border-radius: 6px;
+      border: 1px solid #ddd;
+      background: white;
+      color: #222;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    
+    .btn:hover:not(:disabled) {
+      background: #f5f5f5;
+      border-color: #6366f1;
+    }
+    
+    .btn.primary {
+      background: #6366f1;
+      border-color: #6366f1;
+      color: white;
+    }
+    
+    .btn.primary:hover:not(:disabled) {
+      background: #818cf8;
+    }
+    
+    .btn:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+    
+    .step-indicator {
+      font-size: 14px;
+      color: #666;
+    }
+    
+    .instructions {
+      font-size: 12px;
+      color: #999;
+      text-align: center;
+      padding: 8px;
+      flex-shrink: 0;
+      background: white;
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <h1>
+      <span>🛡️</span>
+      Gauntlet
+    </h1>
+    <p>PRD Red-Teaming Workflow</p>
+  </header>
+  
+  <div class="flow-container">
+    <div class="flowchart" id="flowchart">
+      <svg id="edges" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"></svg>
+    </div>
+  </div>
+  
+  <div class="controls">
+    <button class="btn" id="prevBtn" onclick="prevStep()">← Previous</button>
+    <span class="step-indicator" id="indicator"></span>
+    <button class="btn primary" id="nextBtn" onclick="nextStep()">Next →</button>
+  </div>
+  <div class="instructions">Click Next to reveal each step • Use arrow keys to navigate</div>
+  
+  <script>
+    const steps = [
+      { id: 1, title: "PRD Input", description: "Load and validate PRD document", x: 280, y: 20, color: "#4a90d9" },
+      { id: 2, title: "Analyzer Agent", description: "Split PRD into reviewable sections", x: 280, y: 140, color: "#d94a4a" },
+      { id: 3, title: "Triage Agent", description: "Score sections by risk (1-5)", x: 280, y: 260, color: "#8b5cf6" },
+      { id: 4, title: "Scenario Generator", description: "Create adversarial test scenarios", x: 280, y: 380, color: "#38a169" },
+      { id: 5, title: "Persona Reviews", description: "6 AI personas review in parallel", x: 280, y: 500, color: "#c9a227" },
+      { id: 6, title: "Orchestrator", description: "Evaluate convergence", x: 280, y: 620, color: "#d94a4a" },
+      { id: 7, title: "More rounds?", description: "", x: 280, y: 740, color: "#c9a227" },
+      { id: 8, title: "Report Generation", description: "Compile final feasibility report", x: 280, y: 860, color: "#2e7d32" },
+    ];
+    
+    const edges = [
+      { from: 1, to: 2 },
+      { from: 2, to: 3 },
+      { from: 3, to: 4 },
+      { from: 4, to: 5 },
+      { from: 5, to: 6 },
+      { from: 6, to: 7 },
+      { from: 7, to: 8, label: "No" },
+      { from: 7, to: 5, label: "Yes", type: "loop" },
+    ];
+    
+    const notes = [
+      { step: 2, x: 540, y: 140, text: "Analyzer:\n• Splits PRD into sections\n• Extracts metadata\n• Creates SEC-*.json files" },
+      { step: 3, x: 540, y: 260, text: "Triage:\n• Analyzes vs codebase\n• Scores complexity\n• Identifies risk factors" },
+      { step: 5, x: 540, y: 500, text: "Personas:\n• Engineer, QA, Security\n• PM, DevOps, UX\n• Run in parallel" },
+      { step: 6, x: 540, y: 620, text: "Orchestrator:\n• Checks convergence\n• Decides if more rounds\n• Creates round summary" },
+    ];
+    
+    let currentStep = 0;
+    
+    function createNode(step, index) {
+      const node = document.createElement('div');
+      node.className = 'node';
+      node.id = `node-${step.id}`;
+      node.style.left = step.x + 'px';
+      node.style.top = step.y + 'px';
+      node.innerHTML = `
+        <div class="node-title">${step.title}</div>
+        ${step.description ? `<div class="node-description">${step.description}</div>` : ''}
+      `;
+      return node;
+    }
+    
+    function createNote(note) {
+      const noteEl = document.createElement('div');
+      noteEl.className = 'note';
+      noteEl.id = `note-${note.step}`;
+      noteEl.style.left = note.x + 'px';
+      noteEl.style.top = note.y + 'px';
+      noteEl.textContent = note.text;
+      return noteEl;
+    }
+    
+    function drawEdge(edge) {
+      const fromStep = steps.find(s => s.id === edge.from);
+      const toStep = steps.find(s => s.id === edge.to);
+      
+      const fromX = fromStep.x + 120;
+      const fromY = fromStep.y + 80;
+      const toX = toStep.x + 120;
+      const toY = toStep.y;
+      
+      const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+      g.classList.add('edge');
+      g.id = `edge-${edge.from}-${edge.to}`;
+      
+      if (edge.type === 'loop') {
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        const d = `M ${fromX} ${fromY} C ${fromX - 100} ${fromY + 60}, ${toX - 100} ${toY - 60}, ${toX - 120} ${toY + 40}`;
+        path.setAttribute('d', d);
+        path.setAttribute('fill', 'none');
+        path.setAttribute('stroke', '#222');
+        path.setAttribute('stroke-width', '2');
+        path.setAttribute('marker-end', 'url(#arrowhead)');
+        g.appendChild(path);
+        
+        if (edge.label) {
+          const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+          text.setAttribute('x', fromX - 80);
+          text.setAttribute('y', (fromY + toY) / 2);
+          text.setAttribute('class', 'edge-label');
+          text.textContent = edge.label;
+          g.appendChild(text);
+        }
+      } else {
+        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        line.setAttribute('x1', fromX);
+        line.setAttribute('y1', fromY);
+        line.setAttribute('x2', toX);
+        line.setAttribute('y2', toY);
+        line.setAttribute('marker-end', 'url(#arrowhead)');
+        g.appendChild(line);
+        
+        if (edge.label) {
+          const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+          text.setAttribute('x', (fromX + toX) / 2 + 10);
+          text.setAttribute('y', (fromY + toY) / 2);
+          text.setAttribute('class', 'edge-label');
+          text.textContent = edge.label;
+          g.appendChild(text);
+        }
+      }
+      
+      return g;
+    }
+    
+    function init() {
+      const flowchart = document.getElementById('flowchart');
+      const svg = document.getElementById('edges');
+      
+      const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+      const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
+      marker.setAttribute('id', 'arrowhead');
+      marker.setAttribute('markerWidth', '10');
+      marker.setAttribute('markerHeight', '10');
+      marker.setAttribute('refX', '9');
+      marker.setAttribute('refY', '3');
+      marker.setAttribute('orient', 'auto');
+      const polygon = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+      polygon.setAttribute('points', '0 0, 10 3, 0 6');
+      marker.appendChild(polygon);
+      defs.appendChild(marker);
+      svg.appendChild(defs);
+      
+      steps.forEach((step, i) => {
+        flowchart.appendChild(createNode(step, i));
+      });
+      
+      edges.forEach(edge => {
+        svg.appendChild(drawEdge(edge));
+      });
+      
+      notes.forEach(note => {
+        flowchart.appendChild(createNote(note));
+      });
+      
+      render();
+    }
+    
+    function render() {
+      steps.forEach((step, index) => {
+        const node = document.getElementById(`node-${step.id}`);
+        if (index <= currentStep) {
+          node.classList.add('visible');
+          if (index === currentStep) {
+            node.classList.add('active');
+          } else {
+            node.classList.remove('active');
+          }
+        } else {
+          node.classList.remove('visible', 'active');
+        }
+      });
+      
+      edges.forEach(edge => {
+        const fromIndex = steps.findIndex(s => s.id === edge.from);
+        const toIndex = steps.findIndex(s => s.id === edge.to);
+        const edgeEl = document.getElementById(`edge-${edge.from}-${edge.to}`);
+        if (fromIndex <= currentStep && toIndex <= currentStep) {
+          edgeEl.classList.add('visible');
+        } else {
+          edgeEl.classList.remove('visible');
+        }
+      });
+      
+      notes.forEach(note => {
+        const noteEl = document.getElementById(`note-${note.step}`);
+        const stepIndex = steps.findIndex(s => s.id === note.step);
+        if (stepIndex <= currentStep) {
+          noteEl.classList.add('visible');
+        } else {
+          noteEl.classList.remove('visible');
+        }
+      });
+      
+      document.getElementById('indicator').textContent = `Step ${currentStep + 1} of ${steps.length}`;
+      document.getElementById('prevBtn').disabled = currentStep === 0;
+      document.getElementById('nextBtn').disabled = currentStep === steps.length - 1;
+    }
+    
+    function nextStep() {
+      if (currentStep < steps.length - 1) {
+        currentStep++;
+        render();
+      }
+    }
+    
+    function prevStep() {
+      if (currentStep > 0) {
+        currentStep--;
+        render();
+      }
+    }
+    
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') nextStep();
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') prevStep();
+    });
+    
+    init();
+  </script>
+</body>
+</html>

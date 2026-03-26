@@ -144,13 +144,16 @@ Core OAuth flow exists but lacks production-ready error handling and security ha
 **Feasibility Score: 6/10** (doable but requires significant hardening)
 ```
 
-## Output Signal
+## Output Instructions
 
-After completing your review, output:
+1. **Output your findings JSON** wrapped in a ```json code fence (as shown in Output Format above)
+2. **After the JSON**, output the completion signal with the actual section ID:
 
 ```
 <gauntlet>REVIEW_COMPLETE:SEC-001:engineer</gauntlet>
 ```
+
+**Important:** Replace SEC-001 with the actual section ID you reviewed.
 
 ## Important Guidelines
 

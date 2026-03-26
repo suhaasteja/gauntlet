@@ -7,6 +7,12 @@ state/rounds/
 state/logs/
 state/config.json
 
+# Library state files (also generated)
+lib/state/prd-sections/
+lib/state/scenarios/
+lib/state/reviews/
+lib/state/rounds/
+
 # Output reports
 output/
 
@@ -18,3 +24,5 @@ output/
 
 # Temp files
 *.tmp
+
+

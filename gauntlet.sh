@@ -25,7 +25,8 @@ LIB_DIR="$SCRIPT_DIR/lib"
 OUTPUT_DIR="$SCRIPT_DIR/output"
 
 # Defaults
-TOOL="amp"
+TOOL="claude"
+MODEL="claude-sonnet"
 MAX_ROUNDS=3
 MAX_PARALLEL=4
 RISK_THRESHOLD=3
@@ -66,6 +67,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --tool=*)
       TOOL="${1#*=}"
+      shift
+      ;;
+    --model)
+      MODEL="$2"
+      shift 2
+      ;;
+    --model=*)
+      MODEL="${1#*=}"
       shift
       ;;
     --max-rounds)
@@ -109,7 +118,8 @@ while [[ $# -gt 0 ]]; do
       echo "  --prd FILE              Path to PRD document"
       echo "  --codebase DIR          Path to codebase root (default: .)"
       echo "  --personas LIST         Comma-separated (default: all)"
-      echo "  --tool amp|claude       AI tool to use (default: amp)"
+      echo "  --tool amp|claude       AI tool to use (default: claude)"
+      echo "  --model MODEL           AI model to use (default: claude-sonnet)"
       echo "  --max-rounds N          Max review rounds (default: 3)"
       echo "  --parallel N            Max parallel agents (default: 4)"
       echo "  --risk-threshold N      Min risk score for deep review (default: 3)"
@@ -203,9 +213,9 @@ EOF
   local output
   
   if [[ "$TOOL" == "amp" ]]; then
-    output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | amp --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
+    output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | amp --model "$MODEL" --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
   else
-    output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | claude --dangerously-skip-permissions --print 2>&1 | tee /dev/stderr) || true
+    output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | claude --model "$MODEL" --dangerously-skip-permissions --print 2>&1 | tee /dev/stderr) || true
   fi
   
   agent_log "$analyzer_id" "Analysis complete"
@@ -214,8 +224,25 @@ EOF
   
   # Check for completion signal
   if echo "$output" | grep -q "<gauntlet>ANALYSIS_COMPLETE</gauntlet>"; then
-    log_success "Analyzer: PRD sections created"
-    return 0
+    # Extract JSON array from output (between ```json and the next ```)
+    local sections_json=$(echo "$output" | extract_json_block)
+    
+    if [[ -n "$sections_json" ]] && echo "$sections_json" | jq empty 2>/dev/null; then
+      # Parse JSON and create individual section files
+      echo "$sections_json" | jq -c ".[]" 2>/dev/null | while read -r section; do
+        local section_id=$(echo "$section" | jq -r ".id")
+        echo "$section" | jq . > "$STATE_DIR/prd-sections/${section_id}.json"
+        log_debug "Created section file: ${section_id}.json"
+      done
+      
+      local section_count=$(ls -1 "$STATE_DIR/prd-sections"/*.json 2>/dev/null | wc -l | xargs)
+      log_success "Analyzer: Created $section_count PRD sections"
+      return 0
+    else
+      log_error "Analyzer: Could not extract valid JSON from output"
+      log_debug "Extracted JSON: $sections_json"
+      return 1
+    fi
   else
     log_error "Analyzer: No completion signal detected"
     return 1
@@ -241,7 +268,7 @@ run_triage() {
 $CODEBASE_PATH
 
 ## PRD Sections
-$(for f in "$STATE_DIR/prd-sections"/*.json; do [[ -f "$f" ]] && cat "$f"; done | jq -s '.')
+$(for f in "$STATE_DIR/prd-sections"/*.json; do [[ -f "$f" ]] && cat "$f"; done | jq -s .)
 
 ## Your Task
 Score each section by risk (1-5) and update the section files with riskScore and riskFactors.
@@ -254,9 +281,9 @@ EOF
   local output
   
   if [[ "$TOOL" == "amp" ]]; then
-    output=$(cd "$CODEBASE_PATH" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | amp --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
+    output=$(cd "$CODEBASE_PATH" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | amp --model "$MODEL" --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
   else
-    output=$(cd "$CODEBASE_PATH" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | claude --dangerously-skip-permissions --print 2>&1 | tee /dev/stderr) || true
+    output=$(cd "$CODEBASE_PATH" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | claude --model "$MODEL" --dangerously-skip-permissions --print 2>&1 | tee /dev/stderr) || true
   fi
   
   agent_log "$triage_id" "Triage complete"
@@ -264,8 +291,35 @@ EOF
   deregister_agent "$triage_id"
   
   if echo "$output" | grep -q "<gauntlet>TRIAGE_COMPLETE</gauntlet>"; then
-    log_success "Triage: Risk scores assigned"
-    return 0
+    # Extract JSON array from output (between ```json and the next ```)
+    local triage_json=$(echo "$output" | extract_json_block)
+    
+    if [[ -n "$triage_json" ]] && echo "$triage_json" | jq empty 2>/dev/null; then
+      # Parse JSON and update section files with risk scores
+      echo "$triage_json" | jq -c ".[]" 2>/dev/null | while read -r risk_data; do
+        local section_id=$(echo "$risk_data" | jq -r ".id")
+        local section_file="$STATE_DIR/prd-sections/${section_id}.json"
+        
+        if [[ -f "$section_file" ]]; then
+          local risk_score=$(echo "$risk_data" | jq -r ".riskScore")
+          local risk_factors=$(echo "$risk_data" | jq -c ".riskFactors")
+          
+          # Update section file with risk data
+          jq --argjson score "$risk_score" --argjson factors "$risk_factors" \
+".riskScore = \$score | .riskFactors = \$factors" \
+            "$section_file" > "$section_file.tmp" && mv "$section_file.tmp" "$section_file"
+          
+          log_debug "Updated ${section_id} with risk score: $risk_score"
+        fi
+      done
+      
+      log_success "Triage: Risk scores assigned"
+      return 0
+    else
+      log_error "Triage: Could not extract valid JSON from output"
+      log_debug "Extracted JSON: $triage_json"
+      return 1
+    fi
   else
     log_error "Triage: No completion signal detected"
     return 1
@@ -309,9 +363,9 @@ EOF
   local output
   
   if [[ "$TOOL" == "amp" ]]; then
-    output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | amp --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
+    output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | amp --model "$MODEL" --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
   else
-    output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | claude --dangerously-skip-permissions --print 2>&1 | tee /dev/stderr) || true
+    output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | claude --model "$MODEL" --dangerously-skip-permissions --print 2>&1 | tee /dev/stderr) || true
   fi
   
   agent_log "$gen_id" "Scenarios generated for $section_id"
@@ -319,7 +373,15 @@ EOF
   deregister_agent "$gen_id"
   
   if echo "$output" | grep -q "<gauntlet>SCENARIOS_GENERATED</gauntlet>"; then
-    log_success "Scenario generator: Created scenarios for $section_id"
+    # Extract JSON from output
+    local scenario_json=$(echo "$output" | extract_json_block)
+    
+    if [[ -n "$scenario_json" ]] && echo "$scenario_json" | jq empty 2>/dev/null; then
+      echo "$scenario_json" | jq . > "$STATE_DIR/scenarios/${section_id}-scenarios.json"
+      log_success "Scenario generator: Created scenarios for $section_id"
+    else
+      log_warn "Scenario generator: Could not extract JSON for $section_id"
+    fi
     return 0
   fi
 }
@@ -353,8 +415,8 @@ run_persona_review() {
   
   # Get review details
   local review_json=$(get_review "$review_id")
-  local section_id=$(echo "$review_json" | jq -r '.sectionId')
-  local persona=$(echo "$review_json" | jq -r '.persona')
+  local section_id=$(echo "$review_json" | jq -r ".sectionId")
+  local persona=$(echo "$review_json" | jq -r ".persona")
   
   # Get section content
   local section_file="$STATE_DIR/prd-sections/${section_id}.json"
@@ -386,7 +448,7 @@ $scenarios_content
 $CODEBASE_PATH
 
 ## Your Task
-Review this PRD section from your persona's perspective. Explore the codebase, test against scenarios, and document findings.
+Review this PRD section from your persona perspective. Explore the codebase, test against scenarios, and document findings.
 
 EOF
 )
@@ -396,15 +458,34 @@ EOF
   local output
   
   if [[ "$TOOL" == "amp" ]]; then
-    output=$(cd "$CODEBASE_PATH" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | amp --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
+    output=$(cd "$CODEBASE_PATH" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | amp --model "$MODEL" --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
   else
-    output=$(cd "$CODEBASE_PATH" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | claude --dangerously-skip-permissions --print 2>&1 | tee /dev/stderr) || true
+    output=$(cd "$CODEBASE_PATH" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | claude --model "$MODEL" --dangerously-skip-permissions --print 2>&1 | tee /dev/stderr) || true
   fi
   
   heartbeat "$persona_id"
   
   # Parse persona result
   if echo "$output" | grep -q "<gauntlet>REVIEW_COMPLETE:${section_id}:${persona}</gauntlet>"; then
+    # Extract findings JSON from output
+    local findings_json=$(echo "$output" | extract_json_block)
+    
+    if [[ -n "$findings_json" ]] && echo "$findings_json" | jq empty 2>/dev/null; then
+      # Save findings to review file
+      local review_file="$STATE_DIR/reviews/${review_id}.json"
+      if [[ -f "$review_file" ]]; then
+        local feasibility=$(echo "$findings_json" | jq -r ".feasibilityScore // 0")
+        local findings=$(echo "$findings_json" | jq -c ".findings // []")
+        local summary=$(echo "$findings_json" | jq -r ".summary // empty")
+        
+        jq --argjson score "$feasibility" --argjson findings "$findings" --arg summary "$summary" \
+".feasibilityScore = \$score | .findings = \$findings | .summary = \$summary" \
+          "$review_file" > "$review_file.tmp" && mv "$review_file.tmp" "$review_file"
+      fi
+    else
+      log_warn "Persona $persona_id: Could not extract JSON from review output"
+    fi
+    
     log_success "Persona $persona_id: Review $review_id COMPLETED"
     update_review_status "$review_id" "completed"
     agent_review_completed "$persona_id"
@@ -449,16 +530,16 @@ Max Rounds: $MAX_ROUNDS
 Current Round: $round
 
 ## PRD Sections
-$(for f in "$STATE_DIR/prd-sections"/*.json; do [[ -f "$f" ]] && cat "$f"; done | jq -s '.')
+$(for f in "$STATE_DIR/prd-sections"/*.json; do [[ -f "$f" ]] && cat "$f"; done | jq -s .)
 
 ## All Reviews
-$(for f in "$STATE_DIR/reviews"/*.json; do [[ -f "$f" ]] && cat "$f"; done | jq -s '.')
+$(for f in "$STATE_DIR/reviews"/*.json; do [[ -f "$f" ]] && cat "$f"; done | jq -s .)
 
 ## Previous Rounds
-$(for f in "$STATE_DIR/rounds"/*.json; do [[ -f "$f" ]] && cat "$f"; done | jq -s '.')
+$(for f in "$STATE_DIR/rounds"/*.json; do [[ -f "$f" ]] && cat "$f"; done | jq -s .)
 
 ## Your Task
-Evaluate the current round's findings and decide: MORE_ROUNDS, SUFFICIENT, or STUCK.
+Evaluate the current round findings and decide: MORE_ROUNDS, SUFFICIENT, or STUCK.
 Create a round summary file in state/rounds/round-${round}.json
 
 EOF
@@ -469,22 +550,30 @@ EOF
   local output
   
   if [[ "$TOOL" == "amp" ]]; then
-    output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | amp --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
+    output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | amp --model "$MODEL" --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
   else
-    output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | claude --dangerously-skip-permissions --print 2>&1 | tee /dev/stderr) || true
+    output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | claude --model "$MODEL" --dangerously-skip-permissions --print 2>&1 | tee /dev/stderr) || true
   fi
   
   agent_log "$orch_id" "Round $round evaluation complete"
   heartbeat "$orch_id"
   deregister_agent "$orch_id"
   
+  # Extract round summary JSON from output
+  local round_json
+  round_json=$(echo "$output" | extract_json_block)
+  
+  if [[ -n "$round_json" ]] && echo "$round_json" | jq empty 2>/dev/null; then
+    echo "$round_json" | jq . > "$STATE_DIR/rounds/round-${round}.json"
+    log_debug "Saved round $round summary"
+  fi
+  
   # Parse orchestrator decision
   if echo "$output" | grep -q "<gauntlet>SUFFICIENT</gauntlet>"; then
     log_success "Orchestrator: Analysis SUFFICIENT"
     return 0
   elif echo "$output" | grep -q "<gauntlet>STUCK"; then
-    local reason=$(echo "$output" | grep -o "<gauntlet>STUCK:[^<]*</gauntlet>" | sed 's/<gauntlet>STUCK:\([^<]*\)<\/gauntlet>/\1/')
-    log_error "Orchestrator: Analysis STUCK - $reason"
+    log_error "Orchestrator: Analysis STUCK"
     return 2
   elif echo "$output" | grep -q "<gauntlet>MORE_ROUNDS</gauntlet>"; then
     log_info "Orchestrator: MORE_ROUNDS needed"
@@ -538,8 +627,8 @@ main() {
   for section_file in "$STATE_DIR/prd-sections"/*.json; do
     [[ ! -f "$section_file" ]] && continue
     
-    local section_id=$(jq -r '.id' "$section_file")
-    local risk_score=$(jq -r '.riskScore // 0' "$section_file")
+    local section_id=$(jq -r ".id" "$section_file")
+    local risk_score=$(jq -r ".riskScore // 0" "$section_file")
     
     if (( risk_score >= RISK_THRESHOLD )); then
       run_scenario_generator "$section_id" &
@@ -567,8 +656,8 @@ main() {
     for section_file in "$STATE_DIR/prd-sections"/*.json; do
       [[ ! -f "$section_file" ]] && continue
       
-      local section_id=$(jq -r '.id' "$section_file")
-      local risk_score=$(jq -r '.riskScore // 0' "$section_file")
+      local section_id=$(jq -r ".id" "$section_file")
+      local risk_score=$(jq -r ".riskScore // 0" "$section_file")
       
       # Determine which personas should review this section
       for persona in "${PERSONA_ARRAY[@]}"; do
@@ -586,7 +675,7 @@ main() {
     done
     
     # Check if there are reviews to do
-    local pending=$(count_reviews | jq -r '.pending')
+    local pending=$(count_reviews | jq -r ".pending")
     
     if [[ "$pending" == "0" ]]; then
       log_info "No reviews to perform in round $round"

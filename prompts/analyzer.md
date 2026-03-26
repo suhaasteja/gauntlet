@@ -27,25 +27,39 @@ You will receive:
    - Title (from heading or inferred)
    - Content (the actual text)
    - Source location (line numbers or heading path)
-4. **Create section files** in `state/prd-sections/`
+4. **Output a JSON array** of all sections
 
-## Section File Format
+## Output Format
 
-Create one JSON file per section:
+Output a JSON array containing all sections. Each section should have this structure:
 
 ```json
-{
-  "id": "SEC-001",
-  "title": "User Authentication",
-  "content": "The system shall support OAuth2 authentication with the following providers: Google, GitHub, and Microsoft. Users must be able to...",
-  "sourceLocation": "Section 3.1, lines 45-72",
-  "riskScore": null,
-  "riskFactors": [],
-  "status": "pending",
-  "reviewedBy": [],
-  "round": 0,
-  "createdAt": "2026-03-25T12:00:00Z"
-}
+[
+  {
+    "id": "SEC-001",
+    "title": "User Authentication",
+    "content": "The system shall support OAuth2 authentication with the following providers: Google, GitHub, and Microsoft. Users must be able to...",
+    "sourceLocation": "Section 3.1, lines 45-72",
+    "riskScore": null,
+    "riskFactors": [],
+    "status": "pending",
+    "reviewedBy": [],
+    "round": 0,
+    "createdAt": "2026-03-25T12:00:00Z"
+  },
+  {
+    "id": "SEC-002",
+    "title": "Payment Processing",
+    "content": "...",
+    "sourceLocation": "Section 4, lines 73-120",
+    "riskScore": null,
+    "riskFactors": [],
+    "status": "pending",
+    "reviewedBy": [],
+    "round": 0,
+    "createdAt": "2026-03-25T12:00:00Z"
+  }
+]
 ```
 
 ### ID Numbering
@@ -75,27 +89,26 @@ Create one JSON file per section:
 - Creating sections that are just 1-2 sentences
 - Mixing unrelated features in one section
 
-## Example Output
+## Output Instructions
 
-After analyzing a PRD, you should create files like:
-
-```
-state/prd-sections/
-├── SEC-001.json  (User Authentication)
-├── SEC-002.json  (User Profile Management)
-├── SEC-003.json  (Dashboard Overview)
-├── SEC-004.json  (Task Creation and Editing)
-├── SEC-005.json  (Real-time Notifications)
-└── SEC-006.json  (Admin Panel)
-```
-
-## Output Signal
-
-After creating all section files, output:
+1. **Output the JSON array** of all sections (as shown above)
+2. **After the JSON**, output the completion signal:
 
 ```
 <gauntlet>ANALYSIS_COMPLETE</gauntlet>
 ```
+
+**Important:** The JSON array must be valid, parseable JSON. Wrap the entire array in a code fence with `json` language tag:
+
+````markdown
+```json
+[
+  { "id": "SEC-001", ... },
+  { "id": "SEC-002", ... }
+]
+```
+<gauntlet>ANALYSIS_COMPLETE</gauntlet>
+````
 
 ## Important Guidelines
 

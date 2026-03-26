@@ -144,11 +144,16 @@ Your output must be valid JSON:
 **Feasibility Score: 4/10** - Requires significant infrastructure work
 ```
 
-## Output Signal
+## Output Instructions
+
+1. **Output your findings JSON** wrapped in a ```json code fence (as shown in Output Format)
+2. **After the JSON**, output the completion signal with the actual section ID:
 
 ```
 <gauntlet>REVIEW_COMPLETE:SEC-003:devops</gauntlet>
 ```
+
+**Important:** Replace SEC-003 with the actual section ID you reviewed.
 
 ## Important Guidelines
 

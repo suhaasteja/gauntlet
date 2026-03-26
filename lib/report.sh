@@ -60,6 +60,12 @@ generate_report() {
     avg_score=$((total_score * 10 / review_count))
   fi
   
+  # Count sections and get risk distribution
+  local total_sections=$(ls -1 "$SECTIONS_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+  local high_risk=$(for f in "$SECTIONS_DIR"/*.json; do [[ -f "$f" ]] && jq -r 'select(.riskScore >= 4) | .id' "$f"; done 2>/dev/null | wc -l | tr -d ' ')
+  local medium_risk=$(for f in "$SECTIONS_DIR"/*.json; do [[ -f "$f" ]] && jq -r 'select(.riskScore == 3) | .id' "$f"; done 2>/dev/null | wc -l | tr -d ' ')
+  local low_risk=$(for f in "$SECTIONS_DIR"/*.json; do [[ -f "$f" ]] && jq -r 'select(.riskScore <= 2) | .id' "$f"; done 2>/dev/null | wc -l | tr -d ' ')
+  
   # Start writing report
   cat > "$output_file" << EOF
 # PRD Feasibility Report
@@ -68,6 +74,35 @@ generate_report() {
 **Rounds Completed:** $total_rounds  
 **Personas Active:** $personas  
 **Total Findings:** $total_findings
+
+---
+
+## PRD Analysis Summary
+
+**Total Sections:** $total_sections
+
+**Risk Distribution:**
+- 🔴 High Risk (4-5): $high_risk sections
+- 🟡 Medium Risk (3): $medium_risk sections
+- 🟢 Low Risk (1-2): $low_risk sections
+
+EOF
+
+  # Add section list with risk scores
+  if (( total_sections > 0 )); then
+    echo "**Sections Identified:**" >> "$output_file"
+    echo "" >> "$output_file"
+    for section_file in "$SECTIONS_DIR"/*.json; do
+      [[ ! -f "$section_file" ]] && continue
+      local sid=$(jq -r '.id' "$section_file")
+      local stitle=$(jq -r '.title' "$section_file")
+      local srisk=$(jq -r '.riskScore // "N/A"' "$section_file")
+      echo "- **$sid:** $stitle (Risk: $srisk/5)" >> "$output_file"
+    done
+    echo "" >> "$output_file"
+  fi
+  
+  cat >> "$output_file" << EOF
 
 ---
 

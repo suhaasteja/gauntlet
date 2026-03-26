@@ -68,14 +68,20 @@ jq_read() {
 # Safe jq update with atomic write
 jq_update() {
   local file="$1"
-  local update="$2"
+  shift
   
   if [[ ! -f "$file" ]]; then
     log_error "File not found: $file"
     return 1
   fi
   
-  jq "$update" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+  jq "$@" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+}
+
+# Extract the first JSON code block from piped input
+# Usage: echo "$output" | extract_json_block
+extract_json_block() {
+  awk 'BEGIN{p=0} /^```json/{p=1; next} /^```/{if(p) exit} p{print}'
 }
 
 # Generate a unique ID

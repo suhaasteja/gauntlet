@@ -89,9 +89,9 @@ Focus next round on: SEC-001, SEC-003, SEC-005
 <gauntlet>STUCK:reason</gauntlet>
 ```
 
-## Round Summary File
+## Round Summary Output
 
-After making your decision, create a round summary file:
+Output a round summary as JSON wrapped in a ```json code fence:
 
 ```json
 {
@@ -112,7 +112,7 @@ After making your decision, create a round summary file:
 }
 ```
 
-Save this to `state/rounds/round-N.json`.
+Output this JSON **before** the decision signal.
 
 ## Example Orchestrator Analysis
 

@@ -139,11 +139,16 @@ Your output must be valid JSON:
 **Feasibility Score: 5/10** - Happy path is fine, error paths are broken
 ```
 
-## Output Signal
+## Output Instructions
+
+1. **Output your findings JSON** wrapped in a ```json code fence (as shown in Output Format)
+2. **After the JSON**, output the completion signal with the actual section ID:
 
 ```
 <gauntlet>REVIEW_COMPLETE:SEC-001:ux</gauntlet>
 ```
+
+**Important:** Replace SEC-001 with the actual section ID you reviewed.
 
 ## Important Guidelines
 

@@ -37,31 +37,40 @@ Score each section 1-5 based on these signals:
 
 ## Your Workflow
 
-1. **Read all section files** from `state/prd-sections/*.json`
+1. **Read all section files** from the provided context
 2. **For each section:**
    - Read the PRD content
    - Search the codebase for related code (use grep, find, read relevant files)
    - Check for risk signals listed above
    - Assign a risk score (1-5)
    - Document which risk factors apply
-3. **Update each section file** with:
-   - `riskScore`: integer 1-5
-   - `riskFactors`: array of strings explaining why
+3. **Output a JSON array** with risk scores for all sections
 
-## Section Update Format
+## Output Format
 
-Update each `state/prd-sections/SEC-XXX.json` to add:
+Output a JSON array with risk assessment for each section:
 
 ```json
-{
-  "riskScore": 4,
-  "riskFactors": [
-    "Security-sensitive: handles OAuth tokens and user sessions",
-    "External dependency: relies on third-party OAuth providers",
-    "Vague requirement: 'seamless re-authentication' not defined",
-    "No retry logic found in codebase"
-  ]
-}
+[
+  {
+    "id": "SEC-001",
+    "riskScore": 4,
+    "riskFactors": [
+      "Security-sensitive: handles OAuth tokens and user sessions",
+      "External dependency: relies on third-party OAuth providers",
+      "Vague requirement: 'seamless re-authentication' not defined",
+      "No retry logic found in codebase"
+    ]
+  },
+  {
+    "id": "SEC-002",
+    "riskScore": 2,
+    "riskFactors": [
+      "Well-defined requirements",
+      "Existing implementation found"
+    ]
+  }
+]
 ```
 
 ## Example Triage Session
@@ -94,13 +103,26 @@ Update each `state/prd-sections/SEC-XXX.json` to add:
 - **Factors:** No matching code, quantitative claim without bounds, requires new infrastructure
 ```
 
-## Output Signal
+## Output Instructions
 
-After scoring all sections, output:
+1. **Output the JSON array** with risk scores for all sections (as shown above)
+2. **After the JSON**, output the completion signal:
 
 ```
 <gauntlet>TRIAGE_COMPLETE</gauntlet>
 ```
+
+**Important:** Wrap the JSON array in a code fence with `json` language tag:
+
+````markdown
+```json
+[
+  { "id": "SEC-001", "riskScore": 4, "riskFactors": [...] },
+  { "id": "SEC-002", "riskScore": 2, "riskFactors": [...] }
+]
+```
+<gauntlet>TRIAGE_COMPLETE</gauntlet>
+````
 
 ## Important Guidelines
 
