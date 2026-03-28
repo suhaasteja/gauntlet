@@ -266,7 +266,7 @@ High-risk sections get adversarial scenarios that stress-test PRD claims. This s
 
 ## Comparison to Mr. Burns
 
-Gauntlet is inspired by [Mr. Burns](https://github.com/codeium/mrburns) but serves a different purpose:
+Gauntlet is inspired by [Mr. Burns](https://github.com/arjun-krishna1/mrburns) but serves a different purpose:
 
 | Aspect | Mr. Burns | Gauntlet |
 |--------|-----------|----------|
