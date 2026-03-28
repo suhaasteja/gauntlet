@@ -330,6 +330,6 @@ MIT
 
 ## Credits
 
-Inspired by [Mr. Burns](https://github.com/codeium/mrburns) and Cursor's research on autonomous coding agents.
+Inspired by [Mr. Burns](https://github.com/arjun-krishna1/mrburns) and Cursor's research on autonomous coding agents.
 
 Built with bash, jq, and AI CLI tools (Amp/Claude).
