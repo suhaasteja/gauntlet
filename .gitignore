@@ -14,7 +14,7 @@ lib/state/reviews/
 lib/state/rounds/
 
 # Output reports
-output/
+# output/
 
 # OS files
 .DS_Store

@@ -26,7 +26,7 @@ OUTPUT_DIR="$SCRIPT_DIR/output"
 
 # Defaults
 TOOL="claude"
-MODEL="claude-sonnet"
+MODEL="claude-sonnet-4-5"
 MAX_ROUNDS=3
 MAX_PARALLEL=4
 RISK_THRESHOLD=3
