@@ -34,6 +34,12 @@ PRD_PATH=""
 CODEBASE_PATH="."
 PERSONAS="engineer,qa,pm,ux,security,devops"
 
+# Verify phase defaults
+VERIFY=false
+VERIFY_ONLY=false
+VERIFY_ALL=false
+REPORT_PATH=""
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -125,7 +131,34 @@ while [[ $# -gt 0 ]]; do
       echo "  --risk-threshold N      Min risk score for deep review (default: 3)"
       echo "  --output DIR            Report output dir (default: ./output)"
       echo ""
+      echo "Verification options:"
+      echo "  --verify                Run verification phase after report generation"
+      echo "  --verify-only           Run verification on existing state (no PRD required)"
+      echo "  --verify-all            Also verify Medium findings (default: Critical+High only)"
+      echo "  --report FILE           Existing report path, used with --verify-only"
+      echo ""
       exit 0
+      ;;
+    --verify)
+      VERIFY=true
+      shift
+      ;;
+    --verify-only)
+      VERIFY_ONLY=true
+      VERIFY=true
+      shift
+      ;;
+    --verify-all)
+      VERIFY_ALL=true
+      shift
+      ;;
+    --report)
+      REPORT_PATH="$2"
+      shift 2
+      ;;
+    --report=*)
+      REPORT_PATH="${1#*=}"
+      shift
       ;;
     *)
       echo "Unknown option: $1"
@@ -140,14 +173,15 @@ if [[ "$TOOL" != "amp" && "$TOOL" != "claude" ]]; then
   exit 1
 fi
 
-# Validate PRD path
-if [[ -z "$PRD_PATH" ]]; then
+# Validate PRD path (not required for --verify-only)
+if [[ -z "$PRD_PATH" && "$VERIFY_ONLY" != "true" ]]; then
   echo "Error: --prd is required"
   echo "Usage: ./gauntlet.sh --prd path/to/prd.md --codebase path/to/code"
+  echo "       ./gauntlet.sh --verify-only --codebase path/to/code"
   exit 1
 fi
 
-if [[ ! -f "$PRD_PATH" ]]; then
+if [[ -n "$PRD_PATH" && ! -f "$PRD_PATH" ]]; then
   echo "Error: PRD file not found: $PRD_PATH"
   exit 1
 fi
@@ -157,6 +191,7 @@ source "$LIB_DIR/util.sh"
 source "$LIB_DIR/agent.sh"
 source "$LIB_DIR/review.sh"
 source "$LIB_DIR/report.sh"
+source "$LIB_DIR/verify.sh"
 
 # Check dependencies
 check_jq
@@ -585,6 +620,858 @@ EOF
 }
 
 # =============================================================================
+# Gauntlet Verify - Phase Runners
+# =============================================================================
+
+run_finding_classifier() {
+  local severity_filter="$1"
+  local classifier_id="classifier-1"
+
+  echo ""
+  separator
+  echo "  Running Finding Classifier"
+  separator
+
+  register_agent "classifier" "$classifier_id"
+  agent_log "$classifier_id" "Starting finding classification (filter: $severity_filter)"
+
+  # Build context: all completed reviews as a JSON array
+  local all_reviews
+  all_reviews=$(for f in "$STATE_DIR/reviews"/*.json; do
+    [[ -f "$f" ]] || continue
+    local s
+    s=$(jq -r '.status' "$f")
+    [[ "$s" == "completed" ]] && cat "$f"
+  done | jq -s '.')
+
+  local context
+  context=$(cat << EOF
+# Finding Classification Task
+
+## Severity Filter
+Only classify findings with severity in: $severity_filter
+
+## All Completed Reviews
+$all_reviews
+
+## Codebase Path
+$CODEBASE_PATH
+
+## Your Task
+Read every finding in every review above. For each finding whose severity
+matches the filter, classify it as unit-testable, integration-testable, or
+untestable, then output the full JSON array.
+
+EOF
+)
+
+  local prompt_file="$PROMPTS_DIR/finding-classifier.md"
+  local output
+
+  if [[ "$TOOL" == "amp" ]]; then
+    output=$(cd "$CODEBASE_PATH" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | amp --model "$MODEL" --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
+  else
+    output=$(cd "$CODEBASE_PATH" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | claude --model "$MODEL" --dangerously-skip-permissions --print 2>&1 | tee /dev/stderr) || true
+  fi
+
+  agent_log "$classifier_id" "Classification complete"
+  heartbeat "$classifier_id"
+  deregister_agent "$classifier_id"
+
+  if echo "$output" | grep -q "<gauntlet>CLASSIFICATION_COMPLETE</gauntlet>"; then
+    local classified_json
+    classified_json=$(echo "$output" | extract_json_block)
+
+    if [[ -n "$classified_json" ]] && echo "$classified_json" | jq empty 2>/dev/null; then
+      # Create a verification item for every classified finding
+      echo "$classified_json" | jq -c ".[]" 2>/dev/null | while read -r item; do
+        local finding_id=$(echo "$item" | jq -r ".findingId")
+        local review_id=$(echo "$item" | jq -r ".reviewId")
+        local section_id=$(echo "$item" | jq -r ".sectionId")
+        local persona=$(echo "$item" | jq -r ".persona")
+        local testability=$(echo "$item" | jq -r ".testability")
+        local untestable_reason=$(echo "$item" | jq -r ".untestableReason // empty")
+        local finding=$(echo "$item" | jq -c ".finding")
+
+        create_verification_item "$finding_id" "$review_id" "$section_id" \
+          "$persona" "$finding" "$testability" "$untestable_reason"
+      done
+
+      local total_count
+      total_count=$(echo "$classified_json" | jq 'length')
+      local testable_count
+      testable_count=$(echo "$classified_json" | jq '[.[] | select(.testability != "untestable")] | length')
+      log_success "Classifier: $testable_count testable / $total_count total findings classified"
+      return 0
+    else
+      log_error "Classifier: Could not extract valid JSON from output"
+      return 1
+    fi
+  else
+    log_error "Classifier: No completion signal detected"
+    return 1
+  fi
+}
+
+run_test_generator_worker() {
+  local worker_num="$1"
+  local gen_id="test-gen-$worker_num"
+
+  subseparator
+  log_info "Test generator $gen_id starting"
+
+  register_agent "test_gen" "$gen_id"
+  agent_log "$gen_id" "Starting test generation"
+
+  # Loop: process all available test-generation tasks
+  while true; do
+    local verify_id
+    verify_id=$(claim_verification "$gen_id" "generate") || true
+
+    if [[ -z "$verify_id" ]]; then
+      log_debug "Test generator $gen_id: No more tasks"
+      break
+    fi
+
+    log_info "Test generator $gen_id: Generating test for $verify_id"
+    agent_log "$gen_id" "Generating test for: $verify_id"
+
+    update_verification_status "$verify_id" "generating"
+
+    local verify_json
+    verify_json=$(get_verification "$verify_id")
+    local finding
+    finding=$(echo "$verify_json" | jq -c ".finding")
+    local section_id
+    section_id=$(echo "$verify_json" | jq -r ".sectionId")
+    local testability
+    testability=$(echo "$verify_json" | jq -r ".testability")
+
+    # Get PRD section content
+    local section_content=""
+    local section_file="$STATE_DIR/prd-sections/${section_id}.json"
+    [[ -f "$section_file" ]] && section_content=$(cat "$section_file")
+
+    # Read source files referenced in the finding's codeEvidence
+    local source_files_content=""
+    while IFS= read -r evidence; do
+      [[ -z "$evidence" ]] && continue
+      # Strip :line-range suffix to get bare file path
+      local file_path="${evidence%%:*}"
+      local full_path="$CODEBASE_PATH/$file_path"
+      if [[ -f "$full_path" ]]; then
+        source_files_content+="### File: $file_path"$'\n'
+        source_files_content+="$(cat "$full_path")"$'\n\n'
+      fi
+    done < <(echo "$finding" | jq -r '.codeEvidence[]?' 2>/dev/null)
+
+    local context
+    context=$(cat << EOF
+# Test Generation Task
+
+## Verification ID
+$verify_id
+
+## Finding
+$(echo "$finding" | jq .)
+
+## Testability Classification
+$testability
+
+## PRD Section
+$section_content
+
+## Relevant Source Files
+$source_files_content
+
+## Codebase Root
+$CODEBASE_PATH
+
+## Your Task
+Inspect the codebase for the test framework, then generate one focused
+adversarial test that confirms or refutes this specific finding.
+
+EOF
+)
+
+    local prompt_file="$PROMPTS_DIR/test-generator.md"
+    local output
+
+    if [[ "$TOOL" == "amp" ]]; then
+      output=$(cd "$CODEBASE_PATH" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | amp --model "$MODEL" --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
+    else
+      output=$(cd "$CODEBASE_PATH" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | claude --model "$MODEL" --dangerously-skip-permissions --print 2>&1 | tee /dev/stderr) || true
+    fi
+
+    heartbeat "$gen_id"
+
+    if echo "$output" | grep -q "<gauntlet>TEST_GENERATED:${verify_id}</gauntlet>"; then
+      # Extract metadata JSON and raw test code
+      local metadata_json
+      metadata_json=$(echo "$output" | extract_json_block)
+      local test_code
+      test_code=$(echo "$output" | awk '/<gauntlet-test>/{p=1; next} /<\/gauntlet-test>/{p=0} p{print}')
+
+      if [[ -n "$metadata_json" && -n "$test_code" ]] && echo "$metadata_json" | jq empty 2>/dev/null; then
+        local test_name
+        test_name=$(echo "$metadata_json" | jq -r ".testName")
+        local test_ext
+        test_ext=$(echo "$metadata_json" | jq -r ".testFileExtension")
+        local test_command
+        test_command=$(echo "$metadata_json" | jq -r ".testCommand")
+        local test_framework
+        test_framework=$(echo "$metadata_json" | jq -r ".testFramework")
+
+        # Write test file to generated-tests dir
+        local test_file="$STATE_DIR/generated-tests/${verify_id}.${test_ext}"
+        printf '%s\n' "$test_code" > "$test_file"
+
+        # Update verification record
+        local verify_file="$STATE_DIR/verify/verifications/${verify_id}.json"
+        local now
+        now=$(timestamp)
+        jq --arg testFile "$test_file" \
+           --arg testName "$test_name" \
+           --arg testCommand "$test_command" \
+           --arg testFramework "$test_framework" \
+           --arg now "$now" \
+           '.testFile = $testFile | .testName = $testName | .testCommand = $testCommand
+            | .testFramework = $testFramework | .status = "test_generated" | .updatedAt = $now' \
+           "$verify_file" > "$verify_file.tmp" && mv "$verify_file.tmp" "$verify_file"
+
+        log_success "Test generator $gen_id: test written → $(basename "$test_file")"
+        agent_log "$gen_id" "Test written: $verify_id → $test_file"
+      else
+        log_warn "Test generator $gen_id: Could not extract test content for $verify_id"
+        release_verification "$verify_id" "generate"
+      fi
+    else
+      log_warn "Test generator $gen_id: No completion signal for $verify_id, releasing"
+      release_verification "$verify_id" "generate"
+    fi
+  done
+
+  deregister_agent "$gen_id"
+}
+
+run_tests() {
+  echo ""
+  separator
+  echo "  Running Generated Tests"
+  separator
+
+  local tested=0 skipped=0
+
+  for verify_file in "$STATE_DIR/verify/verifications"/*.json; do
+    [[ ! -f "$verify_file" ]] && continue
+
+    local status
+    status=$(jq -r '.status' "$verify_file")
+    [[ "$status" != "test_generated" ]] && continue
+
+    local verify_id
+    verify_id=$(jq -r '.id' "$verify_file")
+    local test_file
+    test_file=$(jq -r '.testFile' "$verify_file")
+    local test_command
+    test_command=$(jq -r '.testCommand' "$verify_file")
+
+    if [[ -z "$test_file" || ! -f "$test_file" ]]; then
+      log_warn "Test file missing for $verify_id, skipping"
+      ((skipped++))
+      continue
+    fi
+
+    # Replace TESTFILE placeholder with absolute path
+    local abs_test_file
+    abs_test_file="$(cd "$(dirname "$test_file")" && pwd)/$(basename "$test_file")"
+    local actual_command="${test_command//TESTFILE/$abs_test_file}"
+
+    log_info "Running: $verify_id"
+    log_debug "Command: $actual_command"
+
+    local test_output
+    local test_exit_code=0
+    test_output=$(cd "$CODEBASE_PATH" && timeout 120 bash -c "$actual_command" 2>&1) || test_exit_code=$?
+
+    local test_result="passed"
+    if [[ $test_exit_code -ne 0 ]]; then
+      if [[ $test_exit_code -eq 124 ]]; then
+        test_result="error"
+        test_output="Test timed out after 120 seconds.${test_output:+ }${test_output}"
+      else
+        test_result="failed"
+      fi
+    fi
+
+    log_info "  → $test_result (exit $test_exit_code)"
+
+    # Persist test result; advance to verdict_pending phase
+    local now
+    now=$(timestamp)
+    jq --arg result "$test_result" \
+       --arg output "$test_output" \
+       --arg now "$now" \
+       '.testResult = $result | .testOutput = $output | .status = "verdict_pending" | .updatedAt = $now' \
+       "$verify_file" > "$verify_file.tmp" && mv "$verify_file.tmp" "$verify_file"
+
+    ((tested++))
+  done
+
+  log_success "Tests executed: $tested, skipped (missing file): $skipped"
+}
+
+run_verifier_worker() {
+  local worker_num="$1"
+  local verifier_id="verifier-$worker_num"
+
+  subseparator
+  log_info "Verifier $verifier_id starting"
+
+  register_agent "verifier" "$verifier_id"
+  agent_log "$verifier_id" "Starting verdict analysis"
+
+  # Loop: process all available verdict tasks
+  while true; do
+    local verify_id
+    verify_id=$(claim_verification "$verifier_id" "verdict") || true
+
+    if [[ -z "$verify_id" ]]; then
+      log_debug "Verifier $verifier_id: No more tasks"
+      break
+    fi
+
+    log_info "Verifier $verifier_id: Analyzing $verify_id"
+    update_verification_status "$verify_id" "verifying"
+
+    local verify_json
+    verify_json=$(get_verification "$verify_id")
+    local finding
+    finding=$(echo "$verify_json" | jq -c ".finding")
+    local test_file
+    test_file=$(echo "$verify_json" | jq -r ".testFile // empty")
+    local test_name
+    test_name=$(echo "$verify_json" | jq -r ".testName // empty")
+    local test_result
+    test_result=$(echo "$verify_json" | jq -r ".testResult // empty")
+    local test_output
+    test_output=$(echo "$verify_json" | jq -r ".testOutput // empty")
+
+    # Read test code
+    local test_code=""
+    [[ -f "$test_file" ]] && test_code=$(cat "$test_file")
+
+    local context
+    context=$(cat << EOF
+# Verdict Analysis Task
+
+## Verification ID
+$verify_id
+
+## Original Finding
+$(echo "$finding" | jq .)
+
+## Generated Test (${test_name})
+$test_code
+
+## Test Result
+$test_result
+
+## Test Output
+$test_output
+
+## Your Task
+Interpret the test result and deliver a verdict: confirmed_vulnerability,
+false_positive, or inconclusive.
+
+EOF
+)
+
+    local prompt_file="$PROMPTS_DIR/verifier.md"
+    local output
+
+    if [[ "$TOOL" == "amp" ]]; then
+      output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | amp --model "$MODEL" --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
+    else
+      output=$(cd "$SCRIPT_DIR" && echo -e "$context\n\n---\n\n$(cat "$prompt_file")" | claude --model "$MODEL" --dangerously-skip-permissions --print 2>&1 | tee /dev/stderr) || true
+    fi
+
+    heartbeat "$verifier_id"
+
+    if echo "$output" | grep -q "<gauntlet>VERDICT_COMPLETE:${verify_id}</gauntlet>"; then
+      local verdict_json
+      verdict_json=$(echo "$output" | extract_json_block)
+
+      if [[ -n "$verdict_json" ]] && echo "$verdict_json" | jq empty 2>/dev/null; then
+        local verdict
+        verdict=$(echo "$verdict_json" | jq -r ".verdict")
+        local verdict_summary
+        verdict_summary=$(echo "$verdict_json" | jq -r ".verdictSummary")
+        local recommended_action
+        recommended_action=$(echo "$verdict_json" | jq -r ".recommendedAction // empty")
+        local manual_review
+        manual_review=$(echo "$verdict_json" | jq -r ".manualReviewNeeded // false")
+        local manual_reason
+        manual_reason=$(echo "$verdict_json" | jq -r ".manualReviewReason // empty")
+
+        local manual_bool=false
+        [[ "$manual_review" == "true" ]] && manual_bool=true
+
+        # Write verdict back to verification file
+        local verify_file="$STATE_DIR/verify/verifications/${verify_id}.json"
+        local now
+        now=$(timestamp)
+        jq --arg verdict "$verdict" \
+           --arg summary "$verdict_summary" \
+           --arg action "$recommended_action" \
+           --argjson manual "$manual_bool" \
+           --arg reason "$manual_reason" \
+           --arg now "$now" \
+           '.verdict = $verdict | .verdictSummary = $summary | .recommendedAction = $action
+            | .manualReviewNeeded = $manual | .manualReviewReason = $reason
+            | .status = "completed" | .updatedAt = $now' \
+           "$verify_file" > "$verify_file.tmp" && mv "$verify_file.tmp" "$verify_file"
+
+        # Copy confirmed-vulnerability tests to output/verified-tests/ for developer adoption
+        if [[ "$verdict" == "confirmed_vulnerability" && -f "$test_file" ]]; then
+          cp "$test_file" "$OUTPUT_DIR/verified-tests/$(basename "$test_file")"
+          log_success "  Confirmed test saved: output/verified-tests/$(basename "$test_file")"
+        fi
+
+        log_success "Verifier $verifier_id: $verify_id → $verdict"
+        agent_log "$verifier_id" "Verdict: $verify_id → $verdict"
+      else
+        log_warn "Verifier $verifier_id: Could not extract verdict JSON for $verify_id"
+        release_verification "$verify_id" "verdict"
+      fi
+    else
+      log_warn "Verifier $verifier_id: No completion signal for $verify_id, releasing"
+      release_verification "$verify_id" "verdict"
+    fi
+  done
+
+  deregister_agent "$verifier_id"
+}
+
+generate_verified_report() {
+  local base_report="$1"
+  local output_file="$2"
+  local now
+  now=$(timestamp)
+
+  log_info "Generating verified report: $output_file"
+
+  # ── Counts (mirror generate_report) ──────────────────────────────────────
+  local critical=0 high=0 medium=0 low=0 info=0
+
+  for review_file in "$STATE_DIR/reviews"/*.json; do
+    [[ ! -f "$review_file" ]] && continue
+    local rs
+    rs=$(jq -r '.status' "$review_file")
+    [[ "$rs" != "completed" ]] && continue
+    critical=$((critical + $(jq '[.findings[] | select(.severity == "critical")] | length' "$review_file")))
+    high=$((high + $(jq '[.findings[] | select(.severity == "high")] | length' "$review_file")))
+    medium=$((medium + $(jq '[.findings[] | select(.severity == "medium")] | length' "$review_file")))
+    low=$((low + $(jq '[.findings[] | select(.severity == "low")] | length' "$review_file")))
+    info=$((info + $(jq '[.findings[] | select(.severity == "info")] | length' "$review_file")))
+  done
+
+  local total_findings=$((critical + high + medium + low + info))
+  local total_rounds
+  total_rounds=$(ls -1 "$STATE_DIR/rounds"/round-*.json 2>/dev/null | wc -l | tr -d ' ')
+  local personas
+  personas=$(for f in "$STATE_DIR/reviews"/*.json; do [[ -f "$f" ]] && jq -r '.persona' "$f"; done | sort -u | wc -l | tr -d ' ')
+
+  local total_score=0 review_count=0
+  for review_file in "$STATE_DIR/reviews"/*.json; do
+    [[ ! -f "$review_file" ]] && continue
+    local rs
+    rs=$(jq -r '.status' "$review_file")
+    [[ "$rs" != "completed" ]] && continue
+    local score
+    score=$(jq -r '.feasibilityScore // 0' "$review_file")
+    if [[ "$score" != "null" && "$score" != "0" ]]; then
+      total_score=$((total_score + score))
+      ((review_count++))
+    fi
+  done
+
+  local avg_score=0
+  (( review_count > 0 )) && avg_score=$((total_score * 10 / review_count))
+
+  # ── Verification counts ───────────────────────────────────────────────────
+  local v_confirmed=0 v_false_pos=0 v_inconclusive=0 v_untestable=0 v_failed=0
+
+  for vf in "$STATE_DIR/verify/verifications"/*.json; do
+    [[ ! -f "$vf" ]] && continue
+    local testability
+    testability=$(jq -r '.testability' "$vf")
+    local verdict
+    verdict=$(jq -r '.verdict // empty' "$vf")
+    local vstatus
+    vstatus=$(jq -r '.status' "$vf")
+
+    if [[ "$testability" == "untestable" ]]; then
+      ((v_untestable++))
+    elif [[ "$verdict" == "confirmed_vulnerability" ]]; then
+      ((v_confirmed++))
+    elif [[ "$verdict" == "false_positive" ]]; then
+      ((v_false_pos++))
+    elif [[ "$verdict" == "inconclusive" ]]; then
+      ((v_inconclusive++))
+    elif [[ "$vstatus" == "failed" ]]; then
+      ((v_failed++))
+    fi
+  done
+
+  local total_sections
+  total_sections=$(ls -1 "$STATE_DIR/prd-sections"/*.json 2>/dev/null | wc -l | tr -d ' ')
+  local high_risk
+  high_risk=$(for f in "$STATE_DIR/prd-sections"/*.json; do [[ -f "$f" ]] && jq -r 'select(.riskScore >= 4) | .id' "$f"; done 2>/dev/null | wc -l | tr -d ' ')
+  local medium_risk
+  medium_risk=$(for f in "$STATE_DIR/prd-sections"/*.json; do [[ -f "$f" ]] && jq -r 'select(.riskScore == 3) | .id' "$f"; done 2>/dev/null | wc -l | tr -d ' ')
+  local low_risk
+  low_risk=$(for f in "$STATE_DIR/prd-sections"/*.json; do [[ -f "$f" ]] && jq -r 'select(.riskScore <= 2) | .id' "$f"; done 2>/dev/null | wc -l | tr -d ' ')
+
+  # ── Write report header ───────────────────────────────────────────────────
+  cat > "$output_file" << EOF
+# PRD Feasibility Report (Verified)
+
+**Generated:** $now
+**Rounds Completed:** $total_rounds
+**Personas Active:** $personas
+**Total Findings:** $total_findings
+
+---
+
+## Verification Summary
+
+| Verdict | Count |
+|---------|-------|
+| ❌ Confirmed Vulnerability | $v_confirmed |
+| ✅ False Positive | $v_false_pos |
+| ⚠️ Inconclusive | $v_inconclusive |
+| ⚠️ Requires Manual Verification | $v_untestable |
+| ⏭️ Not Verified / Failed | $v_failed |
+
+Confirmed tests available in: \`output/verified-tests/\`
+
+---
+
+## PRD Analysis Summary
+
+**Total Sections:** $total_sections
+
+**Risk Distribution:**
+- 🔴 High Risk (4-5): $high_risk sections
+- 🟡 Medium Risk (3): $medium_risk sections
+- 🟢 Low Risk (1-2): $low_risk sections
+
+EOF
+
+  if (( total_sections > 0 )); then
+    echo "**Sections Identified:**" >> "$output_file"
+    echo "" >> "$output_file"
+    for section_file in "$STATE_DIR/prd-sections"/*.json; do
+      [[ ! -f "$section_file" ]] && continue
+      local sid stitle srisk
+      sid=$(jq -r '.id' "$section_file")
+      stitle=$(jq -r '.title' "$section_file")
+      srisk=$(jq -r '.riskScore // "N/A"' "$section_file")
+      echo "- **$sid:** $stitle (Risk: $srisk/5)" >> "$output_file"
+    done
+    echo "" >> "$output_file"
+  fi
+
+  cat >> "$output_file" << EOF
+
+---
+
+## Executive Summary
+
+**Overall Feasibility Score:** $avg_score/100
+
+**Findings Breakdown:**
+- 🔴 Critical: $critical
+- 🟠 High: $high
+- 🟡 Medium: $medium
+- 🟢 Low: $low
+- ℹ️ Info: $info
+
+EOF
+
+  # ── Section-by-section (same as generate_report) ─────────────────────────
+  echo "" >> "$output_file"
+  echo "---" >> "$output_file"
+  echo "" >> "$output_file"
+  echo "## Section-by-Section Analysis" >> "$output_file"
+  echo "" >> "$output_file"
+
+  for section_file in "$STATE_DIR/prd-sections"/*.json; do
+    [[ ! -f "$section_file" ]] && continue
+
+    local section_id section_title risk_score
+    section_id=$(jq -r '.id' "$section_file")
+    section_title=$(jq -r '.title' "$section_file")
+    risk_score=$(jq -r '.riskScore // "N/A"' "$section_file")
+
+    echo "### $section_id: $section_title" >> "$output_file"
+    echo "" >> "$output_file"
+    echo "**Risk Score:** $risk_score/5" >> "$output_file"
+    echo "" >> "$output_file"
+    echo "| Persona | Feasibility | Key Findings |" >> "$output_file"
+    echo "|---------|-------------|--------------|" >> "$output_file"
+
+    for review_file in "$STATE_DIR/reviews"/${section_id}*.json "$STATE_DIR/reviews"/*-${section_id}.json; do
+      [[ ! -f "$review_file" ]] && continue
+      local status
+      status=$(jq -r '.status' "$review_file")
+      [[ "$status" != "completed" ]] && continue
+
+      local persona score finding_count high_severity verdict_tag
+      persona=$(jq -r '.persona' "$review_file")
+      score=$(jq -r '.feasibilityScore // "N/A"' "$review_file")
+      finding_count=$(jq '[.findings[]] | length' "$review_file")
+      high_severity=$(jq '[.findings[] | select(.severity == "critical" or .severity == "high")] | length' "$review_file")
+
+      local verdict="✅ Good"
+      if (( high_severity > 0 )); then
+        verdict="❌ Blocked"
+      elif [[ "$score" != "N/A" ]] && (( score < 5 )); then
+        verdict="⚠️ Caution"
+      fi
+
+      echo "| $persona | $verdict ($score/10) | $finding_count findings, $high_severity high+ |" >> "$output_file"
+    done
+
+    echo "" >> "$output_file"
+  done
+
+  # ── All Findings by Severity (with verification blocks) ──────────────────
+  echo "" >> "$output_file"
+  echo "---" >> "$output_file"
+  echo "" >> "$output_file"
+  echo "## All Findings by Severity" >> "$output_file"
+  echo "" >> "$output_file"
+
+  for severity in critical high medium low info; do
+    local severity_emoji="ℹ️"
+    case "$severity" in
+      critical) severity_emoji="🔴" ;;
+      high)     severity_emoji="🟠" ;;
+      medium)   severity_emoji="🟡" ;;
+      low)      severity_emoji="🟢" ;;
+    esac
+
+    local sev_count
+    sev_count=$(for f in "$STATE_DIR/reviews"/*.json; do
+      [[ -f "$f" ]] && jq -r ".findings[] | select(.severity == \"$severity\") | .title" "$f" 2>/dev/null
+    done | wc -l | tr -d ' ')
+
+    if (( sev_count > 0 )); then
+      echo "### $severity_emoji $(echo $severity | tr '[:lower:]' '[:upper:]') ($sev_count)" >> "$output_file"
+      echo "" >> "$output_file"
+
+      for review_file in "$STATE_DIR/reviews"/*.json; do
+        [[ ! -f "$review_file" ]] && continue
+        local status
+        status=$(jq -r '.status' "$review_file")
+        [[ "$status" != "completed" ]] && continue
+
+        local persona section_id
+        persona=$(jq -r '.persona' "$review_file")
+        section_id=$(jq -r '.sectionId' "$review_file")
+
+        # Iterate findings at this severity with index tracking
+        local idx=0
+        while IFS= read -r finding_json; do
+          [[ -z "$finding_json" ]] && continue
+
+          local title finding_text code_ev prd_ref recommendation
+          title=$(echo "$finding_json" | jq -r '.title')
+          finding_text=$(echo "$finding_json" | jq -r '.finding')
+          code_ev=$(echo "$finding_json" | jq -r '.codeEvidence | join(", ")')
+          prd_ref=$(echo "$finding_json" | jq -r '.prdReference')
+          recommendation=$(echo "$finding_json" | jq -r '.recommendation')
+
+          local finding_id="${persona}-${section_id}-f${idx}"
+          local verify_block
+          verify_block=$(get_verification_block "$finding_id")
+
+          echo "**[$title]** ($section_id, $persona)" >> "$output_file"
+          echo "" >> "$output_file"
+          if [[ -n "$verify_block" ]]; then
+            echo "$verify_block" >> "$output_file"
+            echo "" >> "$output_file"
+          fi
+          echo "$finding_text" >> "$output_file"
+          echo "" >> "$output_file"
+          echo "- **Code:** $code_ev" >> "$output_file"
+          echo "- **PRD:** $prd_ref" >> "$output_file"
+          echo "- **Recommendation:** $recommendation" >> "$output_file"
+          echo "" >> "$output_file"
+
+          ((idx++))
+        done < <(jq -c ".findings[] | select(.severity == \"$severity\")" "$review_file" 2>/dev/null)
+      done
+    fi
+  done
+
+  # ── Recommendations ───────────────────────────────────────────────────────
+  echo "" >> "$output_file"
+  echo "---" >> "$output_file"
+  echo "" >> "$output_file"
+  echo "## Recommendations" >> "$output_file"
+  echo "" >> "$output_file"
+
+  local rec_num=1
+  for review_file in "$STATE_DIR/reviews"/*.json; do
+    [[ ! -f "$review_file" ]] && continue
+    local status
+    status=$(jq -r '.status' "$review_file")
+    [[ "$status" != "completed" ]] && continue
+
+    jq -r ".findings[] | select(.severity == \"critical\" or .severity == \"high\") |
+      \"$rec_num. **\(.title)** — \(.recommendation)\"" \
+      "$review_file" >> "$output_file" 2>/dev/null
+
+    ((rec_num++))
+  done
+
+  # ── Review rounds ─────────────────────────────────────────────────────────
+  echo "" >> "$output_file"
+  echo "---" >> "$output_file"
+  echo "" >> "$output_file"
+  echo "## Review Rounds" >> "$output_file"
+  echo "" >> "$output_file"
+
+  for round_file in "$STATE_DIR/rounds"/round-*.json; do
+    [[ ! -f "$round_file" ]] && continue
+
+    local round decision reasoning sections
+    round=$(jq -r '.round' "$round_file")
+    decision=$(jq -r '.orchestratorDecision' "$round_file")
+    reasoning=$(jq -r '.reasoning' "$round_file")
+    sections=$(jq -r '.sectionsReviewed | join(", ")' "$round_file")
+
+    echo "### Round $round" >> "$output_file"
+    echo "" >> "$output_file"
+    echo "- **Sections Reviewed:** $sections" >> "$output_file"
+    echo "- **Decision:** $decision" >> "$output_file"
+    echo "- **Reasoning:** $reasoning" >> "$output_file"
+    echo "" >> "$output_file"
+  done
+
+  log_success "Verified report generated: $output_file"
+}
+
+run_verify_pipeline() {
+  echo ""
+  separator
+  echo "  GAUNTLET VERIFY - Closing the Loop"
+  separator
+
+  # Initialize verify state dirs
+  init_verify
+
+  # Severity gate: critical+high by default; +medium with --verify-all
+  local severity_filter="critical,high"
+  [[ "$VERIFY_ALL" == "true" ]] && severity_filter="critical,high,medium"
+  log_info "Verifying findings at severity: $severity_filter"
+
+  # Step V1: Classify findings by testability
+  log_info "Verify Step 1: Classifying findings..."
+  if ! run_finding_classifier "$severity_filter"; then
+    log_error "Finding classifier failed. Skipping verification."
+    return 1
+  fi
+
+  local testable_count
+  testable_count=$(for f in "$STATE_DIR/verify/verifications"/*.json 2>/dev/null; do
+    [[ -f "$f" ]] && jq -r 'select(.testability != "untestable") | .id' "$f"
+  done | wc -l | tr -d ' ')
+
+  if [[ "$testable_count" == "0" ]]; then
+    log_warn "No testable findings found. Generating verified report with manual-review flags only."
+    local base_report="${REPORT_PATH:-$OUTPUT_DIR/report.md}"
+    generate_verified_report "$base_report" "$OUTPUT_DIR/verified-report.md"
+    log_success "Verified report: $OUTPUT_DIR/verified-report.md"
+    return 0
+  fi
+
+  # Step V2: Generate tests (parallel workers)
+  echo ""
+  separator
+  echo "  Verify Step 2: Generating Tests ($MAX_PARALLEL workers)"
+  separator
+
+  local pids=()
+  for i in $(seq 1 $MAX_PARALLEL); do
+    run_test_generator_worker $i &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do
+    wait $pid 2>/dev/null || true
+  done
+  log_success "Test generation complete"
+
+  # Step V3: Execute tests
+  run_tests
+
+  # Step V4: Interpret results (parallel verifier workers)
+  echo ""
+  separator
+  echo "  Verify Step 4: Interpreting Results ($MAX_PARALLEL workers)"
+  separator
+
+  pids=()
+  for i in $(seq 1 $MAX_PARALLEL); do
+    run_verifier_worker $i &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do
+    wait $pid 2>/dev/null || true
+  done
+  log_success "Verification complete"
+
+  # Step V5: Generate verified report
+  echo ""
+  separator
+  echo "  Verify Step 5: Generating Verified Report"
+  separator
+
+  local base_report="${REPORT_PATH:-$OUTPUT_DIR/report.md}"
+  generate_verified_report "$base_report" "$OUTPUT_DIR/verified-report.md"
+
+  # Print verification summary
+  echo ""
+  separator
+  echo "  VERIFICATION SUMMARY"
+  separator
+  echo ""
+  local v_confirmed=0 v_false_pos=0 v_inconclusive=0 v_untestable=0
+  for vf in "$STATE_DIR/verify/verifications"/*.json; do
+    [[ ! -f "$vf" ]] && continue
+    local testability verdict
+    testability=$(jq -r '.testability' "$vf")
+    verdict=$(jq -r '.verdict // empty' "$vf")
+    if [[ "$testability" == "untestable" ]]; then ((v_untestable++))
+    elif [[ "$verdict" == "confirmed_vulnerability" ]]; then ((v_confirmed++))
+    elif [[ "$verdict" == "false_positive" ]]; then ((v_false_pos++))
+    elif [[ "$verdict" == "inconclusive" ]]; then ((v_inconclusive++))
+    fi
+  done
+  echo "  ❌ Confirmed Vulnerabilities: $v_confirmed"
+  echo "  ✅ False Positives:           $v_false_pos"
+  echo "  ⚠️  Inconclusive:              $v_inconclusive"
+  echo "  ⚠️  Requires Manual Review:   $v_untestable"
+  echo ""
+  log_success "Verified report: $OUTPUT_DIR/verified-report.md"
+  [[ $v_confirmed -gt 0 ]] && log_info "Confirmed tests: $OUTPUT_DIR/verified-tests/"
+  echo ""
+}
+
+# =============================================================================
 # Main Loop
 # =============================================================================
 
@@ -595,7 +1482,7 @@ main() {
   separator
   echo ""
   echo "Configuration:"
-  echo "  PRD: $PRD_PATH"
+  echo "  PRD: ${PRD_PATH:-<none — verify-only mode>}"
   echo "  Codebase: $CODEBASE_PATH"
   echo "  Personas: $PERSONAS"
   echo "  Tool: $TOOL"
@@ -603,8 +1490,23 @@ main() {
   echo "  Max Parallel: $MAX_PARALLEL"
   echo "  Risk Threshold: $RISK_THRESHOLD"
   echo "  Output: $OUTPUT_DIR"
+  if [[ "$VERIFY" == "true" ]]; then
+    echo "  Verify: enabled"
+    echo "  Verify All: $VERIFY_ALL"
+  fi
   echo ""
-  
+
+  # ── Verify-only mode: skip full PRD pipeline, run verification on existing state ──
+  if [[ "$VERIFY_ONLY" == "true" ]]; then
+    init_state
+    if [[ -z "$(ls -1 "$STATE_DIR/reviews"/*.json 2>/dev/null)" ]]; then
+      log_error "No completed reviews found in $STATE_DIR/reviews/. Run the full pipeline first."
+      exit 1
+    fi
+    run_verify_pipeline
+    return 0
+  fi
+
   # Initialize
   init_state
   
@@ -725,13 +1627,18 @@ main() {
   
   local report_file="$OUTPUT_DIR/report.md"
   generate_report "$report_file"
-  
+
   # Print summary
   print_summary
-  
+
   echo ""
   log_success "Report saved to: $report_file"
   echo ""
+
+  # Step 6: Verification phase (if requested)
+  if [[ "$VERIFY" == "true" ]]; then
+    run_verify_pipeline
+  fi
 }
 
 # Run main
